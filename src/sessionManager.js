@@ -15,6 +15,7 @@ import { sendWebhook } from './webhook.js';
 
 const sessions = new Map();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const MAX_MESSAGE_CACHE = Number(process.env.MAX_MESSAGE_CACHE || 2000);
 
 function nowIso() {
   return new Date().toISOString();
@@ -50,6 +51,123 @@ function getMessageText(message) {
   );
 }
 
+function getMessageType(message) {
+  if (!message || typeof message !== 'object') return 'unknown';
+
+  if (message.ephemeralMessage?.message) {
+    return getMessageType(message.ephemeralMessage.message);
+  }
+
+  if (message.viewOnceMessage?.message) {
+    return getMessageType(message.viewOnceMessage.message);
+  }
+
+  const keys = Object.keys(message);
+  return keys[0] || 'unknown';
+}
+
+function getTimestampValue(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value?.toNumber === 'function') return value.toNumber();
+  if (typeof value?.low === 'number') return value.low;
+
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function timestampToIso(value) {
+  const numeric = getTimestampValue(value);
+  if (!numeric) return null;
+
+  const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  return new Date(milliseconds).toISOString();
+}
+
+function normalizeContact(contact = {}) {
+  const jid = contact.id || contact.jid || null;
+  const phoneNumber = extractPhoneFromJid(jid);
+  const displayName = contact.notify || contact.name || contact.verifiedName || contact.pushName || phoneNumber || jid || 'Unknown';
+
+  return {
+    id: jid || phoneNumber,
+    jid,
+    phoneNumber,
+    displayName,
+    pushName: contact.notify || contact.pushName || null,
+    verifiedName: contact.verifiedName || null,
+    shortName: contact.short || null,
+    isBusiness: Boolean(contact.verifiedName),
+    updatedAt: nowIso(),
+  };
+}
+
+function normalizeChat(chat = {}) {
+  const jid = chat.id || null;
+  const conversationTimestamp = chat.conversationTimestamp || chat.lastMessageRecvTimestamp || null;
+
+  return {
+    id: jid,
+    jid,
+    name: chat.name || chat.subject || extractPhoneFromJid(jid) || jid || 'Unknown chat',
+    unreadCount: chat.unreadCount || 0,
+    archived: Boolean(chat.archive),
+    pinned: Boolean(chat.pinned),
+    muteEndTime: getTimestampValue(chat.muteEndTime) || null,
+    lastMessageAt: timestampToIso(conversationTimestamp),
+    conversationTimestamp: getTimestampValue(conversationTimestamp),
+    updatedAt: nowIso(),
+  };
+}
+
+function normalizeMessage(message = {}) {
+  const remoteJid = message?.key?.remoteJid || null;
+  const participant = message?.key?.participant || null;
+  const from = jidNormalizedUser(participant || remoteJid || '');
+  const providerMessageId = message?.key?.id || `${remoteJid || 'unknown'}-${getTimestampValue(message?.messageTimestamp) || Date.now()}`;
+
+  return {
+    id: providerMessageId,
+    providerMessageId,
+    remoteJid,
+    participant,
+    from,
+    fromMe: Boolean(message?.key?.fromMe),
+    text: getMessageText(message?.message),
+    messageType: getMessageType(message?.message),
+    messageTimestamp: getTimestampValue(message?.messageTimestamp),
+    messageAt: timestampToIso(message?.messageTimestamp),
+    updatedAt: nowIso(),
+  };
+}
+
+function createSessionRecord({ id, label, workspaceId, connectionId }) {
+  return {
+    id,
+    status: 'pending',
+    label: label || null,
+    workspaceId: workspaceId || null,
+    connectionId: connectionId || null,
+    qr: null,
+    qrExpiresAt: null,
+    connectedAt: null,
+    lastActivityAt: null,
+    lastError: null,
+    socket: null,
+    authDir: null,
+    isStarting: false,
+    phoneNumber: null,
+    accountJid: null,
+    contacts: new Map(),
+    chats: new Map(),
+    messages: new Map(),
+    historySyncStatus: 'idle',
+    historySyncedAt: null,
+    historySyncStartedAt: null,
+  };
+}
+
 function publicSession(session) {
   return {
     id: session.id,
@@ -64,7 +182,67 @@ function publicSession(session) {
     connectedAt: session.connectedAt || null,
     qrExpiresAt: session.qrExpiresAt || null,
     hasQr: Boolean(session.qr),
+    historySyncStatus: session.historySyncStatus || 'idle',
+    historySyncStartedAt: session.historySyncStartedAt || null,
+    historySyncedAt: session.historySyncedAt || null,
+    contactsCount: session.contacts?.size || 0,
+    chatsCount: session.chats?.size || 0,
+    messagesCount: session.messages?.size || 0,
   };
+}
+
+function upsertContacts(session, contacts = []) {
+  for (const contact of contacts) {
+    const normalized = normalizeContact(contact);
+    if (!normalized.id) continue;
+    session.contacts.set(normalized.id, {
+      ...(session.contacts.get(normalized.id) || {}),
+      ...normalized,
+    });
+  }
+}
+
+function upsertChats(session, chats = []) {
+  for (const chat of chats) {
+    const normalized = normalizeChat(chat);
+    if (!normalized.id) continue;
+    session.chats.set(normalized.id, {
+      ...(session.chats.get(normalized.id) || {}),
+      ...normalized,
+    });
+  }
+}
+
+function trimMessageCache(session) {
+  const entries = Array.from(session.messages.values()).sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+  while (entries.length > MAX_MESSAGE_CACHE) {
+    const oldest = entries.shift();
+    if (oldest?.id) {
+      session.messages.delete(oldest.id);
+    }
+  }
+}
+
+function upsertMessages(session, messages = []) {
+  for (const message of messages) {
+    const normalized = normalizeMessage(message);
+    if (!normalized.id) continue;
+
+    session.messages.set(normalized.id, {
+      ...(session.messages.get(normalized.id) || {}),
+      ...normalized,
+    });
+  }
+
+  trimMessageCache(session);
+}
+
+function listSortedValues(map) {
+  return Array.from(map.values()).sort((a, b) => {
+    const left = a?.displayName || a?.name || a?.jid || a?.id || '';
+    const right = b?.displayName || b?.name || b?.jid || b?.id || '';
+    return String(left).localeCompare(String(right));
+  });
 }
 
 async function ensureSessionsDir() {
@@ -101,7 +279,7 @@ async function bindSocket(session, isRestore = false) {
     version,
     auth: state,
     printQRInTerminal: false,
-    syncFullHistory: false,
+    syncFullHistory: true,
     logger: logger.child({ sessionId: session.id, scope: 'baileys' }),
   });
 
@@ -109,8 +287,51 @@ async function bindSocket(session, isRestore = false) {
   session.socket = socket;
   session.isStarting = false;
   session.lastError = null;
+  session.historySyncStatus = 'syncing';
+  session.historySyncStartedAt = session.historySyncStartedAt || nowIso();
 
   socket.ev.on('creds.update', saveCreds);
+
+  socket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }) => {
+    upsertContacts(session, contacts || []);
+    upsertChats(session, chats || []);
+    upsertMessages(session, messages || []);
+
+    session.historySyncStatus = isLatest ? 'ready' : 'syncing';
+    session.historySyncedAt = nowIso();
+    session.lastActivityAt = nowIso();
+
+    await emitWebhook('session.history_sync', {
+      sessionId: session.id,
+      workspaceId: session.workspaceId || null,
+      connectionId: session.connectionId || null,
+      status: session.historySyncStatus,
+      contactsCount: session.contacts.size,
+      chatsCount: session.chats.size,
+      messagesCount: session.messages.size,
+      isLatest: Boolean(isLatest),
+    });
+  });
+
+  socket.ev.on('contacts.upsert', (contacts) => {
+    upsertContacts(session, contacts || []);
+    session.lastActivityAt = nowIso();
+  });
+
+  socket.ev.on('contacts.update', (contacts) => {
+    upsertContacts(session, contacts || []);
+    session.lastActivityAt = nowIso();
+  });
+
+  socket.ev.on('chats.upsert', (chats) => {
+    upsertChats(session, chats || []);
+    session.lastActivityAt = nowIso();
+  });
+
+  socket.ev.on('chats.update', (chats) => {
+    upsertChats(session, chats || []);
+    session.lastActivityAt = nowIso();
+  });
 
   socket.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -185,13 +406,16 @@ async function bindSocket(session, isRestore = false) {
   });
 
   socket.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    upsertMessages(session, messages);
+    session.lastActivityAt = nowIso();
+
     if (type !== 'notify') return;
 
-    for (const msg of messages || []) {
+    for (const msg of messages) {
       if (!msg?.message) continue;
       if (msg.key?.fromMe) continue;
-
-      session.lastActivityAt = nowIso();
 
       await emitWebhook('message.received', {
         sessionId: session.id,
@@ -219,22 +443,12 @@ export async function startSession({ sessionId, label, workspaceId, connectionId
     return publicSession(existing);
   }
 
-  const session = existing || {
+  const session = existing || createSessionRecord({
     id,
-    status: 'pending',
-    label: label || null,
-    workspaceId: workspaceId || null,
-    connectionId: connectionId || null,
-    qr: null,
-    qrExpiresAt: null,
-    connectedAt: null,
-    lastActivityAt: null,
-    lastError: null,
-    socket: null,
-    isStarting: false,
-    phoneNumber: null,
-    accountJid: null,
-  };
+    label,
+    workspaceId,
+    connectionId,
+  });
 
   session.label = label || session.label;
   session.workspaceId = workspaceId || session.workspaceId;
@@ -274,6 +488,46 @@ export async function getSessionQr(sessionId) {
     ...publicSession(session),
     qr: session.qr,
     qrDataUrl,
+  };
+}
+
+export function getSessionContacts(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+
+  return {
+    ...publicSession(session),
+    contacts: listSortedValues(session.contacts),
+  };
+}
+
+export function getSessionChats(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+
+  const chats = Array.from(session.chats.values()).sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0));
+
+  return {
+    ...publicSession(session),
+    chats,
+  };
+}
+
+export function getSessionMessages(sessionId, { limit = 100, remoteJid = null } = {}) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+
+  let messages = Array.from(session.messages.values());
+
+  if (remoteJid) {
+    messages = messages.filter((message) => message.remoteJid === remoteJid);
+  }
+
+  messages.sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
+
+  return {
+    ...publicSession(session),
+    messages: messages.slice(0, Math.max(1, Math.min(Number(limit) || 100, MAX_MESSAGE_CACHE))),
   };
 }
 
