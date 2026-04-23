@@ -3,6 +3,9 @@ import { Router } from 'express';
 import {
   deleteSession,
   getSession,
+  getSessionChats,
+  getSessionContacts,
+  getSessionMessages,
   getSessionQr,
   listSessions,
   sendTextMessage,
@@ -52,6 +55,39 @@ router.get('/:id/qr', async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+router.get('/:id/contacts', (req, res) => {
+  const payload = getSessionContacts(req.params.id);
+
+  if (!payload) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  res.json(payload);
+});
+
+router.get('/:id/chats', (req, res) => {
+  const payload = getSessionChats(req.params.id);
+
+  if (!payload) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  res.json(payload);
+});
+
+router.get('/:id/messages', (req, res) => {
+  const payload = getSessionMessages(req.params.id, {
+    limit: req.query?.limit,
+    remoteJid: req.query?.remoteJid || null,
+  });
+
+  if (!payload) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  res.json(payload);
 });
 
 router.post('/:id/send', async (req, res, next) => {
