@@ -1,0 +1,21 @@
+{
+  "name": "ruyaa-whatsapp-session-service",
+  "version": "0.1.0",
+  "description": "External WhatsApp QR/session microservice for Ruyaa Super Agent",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.2",
+    "pino": "^9.9.4",
+    "qrcode": "^1.5.4",
+    "uuid": "^12.0.0"
+  }
+}
