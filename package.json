@@ -12,7 +12,7 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "^6.7.19",
     "express": "^4.21.2",
     "pino": "^9.9.4",
     "qrcode": "^1.5.4",
