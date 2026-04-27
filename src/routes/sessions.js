@@ -8,6 +8,7 @@ import {
   getSessionMessages,
   getSessionQr,
   listSessions,
+  resyncSession,
   sendTextMessage,
   startSession,
 } from '../sessionManager.js';
@@ -124,49 +125,29 @@ router.post('/:id/send', async (req, res, next) => {
   }
 });
 
-router.post('/:id/resync', (req, res) => {
-  const session = getSession(req.params.id);
-  if (!session) {
-    return res.status(404).json({
-      success: false,
-      code: 'SESSION_NOT_FOUND',
-      message: 'WhatsApp session is not loaded. Reconnect required.',
-      requested_session_id: req.params.id,
-      active_session_ids: listSessions().map(s => s.id),
-    });
+router.post('/:id/resync', async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.body?.limit || req.query?.limit || 50) || 50, 10), 200);
+    const result = await resyncSession(req.params.id, { limit });
+
+    if (!result) {
+      return res.status(404).json({
+        success: false,
+        code: 'SESSION_NOT_FOUND',
+        message: 'WhatsApp session is not loaded. Reconnect required.',
+        requested_session_id: req.params.id,
+        active_session_ids: listSessions().map(s => s.id),
+      });
+    }
+
+    if (result.success === false && result.code === 'SESSION_NOT_CONNECTED') {
+      return res.status(400).json(result);
+    }
+
+    res.json(result);
+  } catch (error) {
+    next(error);
   }
-
-  if (session.status !== 'connected') {
-    return res.status(400).json({
-      success: false,
-      code: 'SESSION_NOT_CONNECTED',
-      message: 'WhatsApp session is not connected.',
-      status: session.status,
-    });
-  }
-
-  const limit = Math.min(Math.max(Number(req.body?.limit || req.query?.limit || 50) || 50, 10), 200);
-  const contactsPayload = getSessionContacts(req.params.id) || { contacts: [] };
-  const chatsPayload = getSessionChats(req.params.id) || { chats: [] };
-  const messagesPayload = getSessionMessages(req.params.id, { limit }) || { messages: [] };
-
-  const chats = (chatsPayload.chats || []).slice(0, limit);
-  const messages = messagesPayload.messages || [];
-  const contacts = contactsPayload.contacts || [];
-
-  const status = chats.length || messages.length || contacts.length ? 'ready' : 'empty_result';
-
-  res.json({
-    success: true,
-    status,
-    limit,
-    contacts_imported: contacts.length,
-    chats_imported: chats.length,
-    messages_imported: messages.length,
-    contacts,
-    chats,
-    messages,
-  });
 });
 
 router.delete('/:id', async (req, res, next) => {
