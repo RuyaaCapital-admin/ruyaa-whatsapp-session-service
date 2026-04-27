@@ -16,6 +16,10 @@ import { sendWebhook } from './webhook.js';
 const sessions = new Map();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const MAX_MESSAGE_CACHE = Number(process.env.MAX_MESSAGE_CACHE || 2000);
+const HISTORY_CHAT_LIMIT = Number(process.env.INITIAL_HISTORY_CHAT_LIMIT || 50);
+const HISTORY_SNAPSHOT_COOLDOWN_MS = Number(process.env.HISTORY_SNAPSHOT_COOLDOWN_MS || 30_000);
+const HISTORY_SNAPSHOT_DELAY_MS = Number(process.env.HISTORY_SNAPSHOT_DELAY_MS || 8_000);
+const AVATAR_HYDRATE_LIMIT = Number(process.env.AVATAR_HYDRATE_LIMIT || 12);
 
 function nowIso() {
   return new Date().toISOString();
@@ -30,10 +34,41 @@ function extractPhoneFromJid(jid) {
   return String(jid).split(':')[0].split('@')[0] || null;
 }
 
+function normalizePhone(value) {
+  return value ? String(value).replace(/\D/g, '') : '';
+}
+
+function isValidPhoneNumber(phone) {
+  const digits = normalizePhone(phone);
+  return digits.length >= 7 && digits.length <= 16 && digits !== '0';
+}
+
+function isStatusOrBroadcastJid(jid) {
+  const value = String(jid || '');
+  return value.includes('status@') || value.includes('@broadcast') || value.includes('newsletter') || value === '0';
+}
+
+function isGroupJid(jid) {
+  return String(jid || '').includes('@g.us');
+}
+
+function isDirectWhatsappJid(jid) {
+  const value = String(jid || '');
+  if (!value || isStatusOrBroadcastJid(value) || isGroupJid(value)) return false;
+  if (!value.includes('@s.whatsapp.net') && !value.includes('@c.us')) return false;
+  return isValidPhoneNumber(extractPhoneFromJid(value));
+}
+
+function isImportableChatJid(jid) {
+  // Keep the first version strict: direct user chats only. Groups/status/broadcasts
+  // are noisy and were creating garbage rows in Base44.
+  return isDirectWhatsappJid(jid);
+}
+
 function normalizeRecipient(to) {
   if (!to) return null;
   if (String(to).includes('@')) return to;
-  const cleaned = String(to).replace(/[^\d]/g, '');
+  const cleaned = normalizePhone(to);
   return `${cleaned}@s.whatsapp.net`;
 }
 
@@ -69,6 +104,10 @@ function getMessageType(message) {
   return first;
 }
 
+function isMediaType(type) {
+  return ['image', 'video', 'document', 'audio', 'sticker'].includes(type);
+}
+
 function getTimestampValue(value) {
   if (value == null) return null;
   if (typeof value === 'number') return value;
@@ -90,12 +129,17 @@ function timestampToIso(value) {
 
 function normalizeContact(contact = {}) {
   const jid = contact.id || contact.jid || null;
+  if (!isDirectWhatsappJid(jid)) return null;
+
   const phoneNumber = extractPhoneFromJid(jid);
+  if (!isValidPhoneNumber(phoneNumber)) return null;
+
   const realName = contact.name || contact.verifiedName || contact.notify || contact.pushName || contact.short || null;
-  const displayName = realName || phoneNumber || jid || 'Unknown';
+  const displayName = realName || phoneNumber;
+  const avatar = contact.imgUrl || contact.avatarUrl || contact.profilePicUrl || contact.avatar_url || null;
 
   return {
-    id: jid || phoneNumber,
+    id: jid,
     jid,
     phone: phoneNumber,
     phoneNumber,
@@ -110,8 +154,9 @@ function normalizeContact(contact = {}) {
     verified_name: contact.verifiedName || null,
     shortName: contact.short || null,
     short_name: contact.short || null,
-    avatarUrl: contact.imgUrl || contact.avatarUrl || contact.profilePicUrl || null,
-    avatar_url: contact.imgUrl || contact.avatarUrl || contact.profilePicUrl || null,
+    avatarUrl: avatar,
+    avatar_url: avatar,
+    avatar_last_fetched_at: avatar ? nowIso() : null,
     isBusiness: Boolean(contact.verifiedName),
     is_business: Boolean(contact.verifiedName),
     updatedAt: nowIso(),
@@ -120,9 +165,11 @@ function normalizeContact(contact = {}) {
 
 function normalizeChat(chat = {}) {
   const jid = chat.id || null;
+  if (!isImportableChatJid(jid)) return null;
+
   const conversationTimestamp = chat.conversationTimestamp || chat.lastMessageRecvTimestamp || null;
   const phone = extractPhoneFromJid(jid);
-  const name = chat.name || chat.subject || chat.title || phone || jid || 'Unknown chat';
+  const name = chat.name || chat.subject || chat.title || phone;
 
   return {
     id: jid,
@@ -143,11 +190,17 @@ function normalizeChat(chat = {}) {
 
 function normalizeMessage(message = {}) {
   const remoteJid = message?.key?.remoteJid || null;
+  if (!isImportableChatJid(remoteJid)) return null;
+
   const participant = message?.key?.participant || null;
   const from = jidNormalizedUser(participant || remoteJid || '');
   const providerMessageId = message?.key?.id || `${remoteJid || 'unknown'}-${getTimestampValue(message?.messageTimestamp) || Date.now()}`;
   const type = getMessageType(message?.message);
-  const timestamp = timestampToIso(message?.messageTimestamp);
+  const text = getMessageText(message?.message);
+  const displayText = text || (isMediaType(type) ? `[${type}]` : '');
+  if (!displayText) return null;
+
+  const timestamp = timestampToIso(message?.messageTimestamp) || nowIso();
 
   return {
     id: providerMessageId,
@@ -161,12 +214,12 @@ function normalizeMessage(message = {}) {
     from,
     fromMe: Boolean(message?.key?.fromMe),
     fromSelf: Boolean(message?.key?.fromMe),
-    text: getMessageText(message?.message),
-    body: getMessageText(message?.message),
+    text: displayText,
+    body: displayText,
     type,
     messageType: type,
     message_type: type,
-    messageTimestamp: getTimestampValue(message?.messageTimestamp),
+    messageTimestamp: getTimestampValue(message?.messageTimestamp) || Date.now(),
     timestamp,
     messageAt: timestamp,
     pushName: message?.pushName || null,
@@ -174,6 +227,23 @@ function normalizeMessage(message = {}) {
     sender_name: message?.pushName || null,
     updatedAt: nowIso(),
   };
+}
+
+function mapAckToStatus(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    if (numeric <= 0) return 'failed';
+    if (numeric === 1 || numeric === 2) return 'sent';
+    if (numeric === 3) return 'delivered';
+    if (numeric >= 4) return 'read';
+  }
+
+  const text = String(value || '').toLowerCase();
+  if (text.includes('read') || text.includes('played')) return 'read';
+  if (text.includes('deliver')) return 'delivered';
+  if (text.includes('server') || text.includes('sent') || text.includes('ack')) return 'sent';
+  if (text.includes('error') || text.includes('fail')) return 'failed';
+  return null;
 }
 
 function createSessionRecord({ id, label, workspaceId, connectionId }) {
@@ -196,6 +266,9 @@ function createSessionRecord({ id, label, workspaceId, connectionId }) {
     contacts: new Map(),
     chats: new Map(),
     messages: new Map(),
+    avatarCache: new Map(),
+    historySnapshotTimer: null,
+    lastHistorySnapshotSentAt: 0,
     historySyncStatus: 'idle',
     historySyncedAt: null,
     historySyncStartedAt: null,
@@ -230,7 +303,7 @@ function publicSession(session) {
 function upsertContacts(session, contacts = []) {
   for (const contact of contacts) {
     const normalized = normalizeContact(contact);
-    if (!normalized.id) continue;
+    if (!normalized?.id) continue;
     session.contacts.set(normalized.id, {
       ...(session.contacts.get(normalized.id) || {}),
       ...normalized,
@@ -238,14 +311,43 @@ function upsertContacts(session, contacts = []) {
   }
 }
 
+function ensureContactForChat(session, chat) {
+  if (!chat?.jid || !isDirectWhatsappJid(chat.jid)) return null;
+  const existing = session.contacts.get(chat.jid);
+  if (existing) return existing;
+
+  const phone = extractPhoneFromJid(chat.jid);
+  if (!isValidPhoneNumber(phone)) return null;
+
+  const contact = {
+    id: chat.jid,
+    jid: chat.jid,
+    phone,
+    phoneNumber: phone,
+    phone_number: phone,
+    phone_number_normalized: phone,
+    name: chat.name || phone,
+    displayName: chat.name || phone,
+    display_name: chat.name || phone,
+    pushName: null,
+    push_name: null,
+    avatarUrl: null,
+    avatar_url: null,
+    updatedAt: nowIso(),
+  };
+  session.contacts.set(chat.jid, contact);
+  return contact;
+}
+
 function upsertChats(session, chats = []) {
   for (const chat of chats) {
     const normalized = normalizeChat(chat);
-    if (!normalized.id) continue;
+    if (!normalized?.id) continue;
     session.chats.set(normalized.id, {
       ...(session.chats.get(normalized.id) || {}),
       ...normalized,
     });
+    ensureContactForChat(session, normalized);
   }
 }
 
@@ -262,7 +364,7 @@ function trimMessageCache(session) {
 function upsertMessages(session, messages = []) {
   for (const message of messages) {
     const normalized = normalizeMessage(message);
-    if (!normalized.id) continue;
+    if (!normalized?.id) continue;
 
     session.messages.set(normalized.id, {
       ...(session.messages.get(normalized.id) || {}),
@@ -283,12 +385,13 @@ function listSortedValues(map) {
 
 function listRecentChats(session, limit = 50) {
   return Array.from(session.chats.values())
+    .filter((c) => isImportableChatJid(c?.jid || c?.id))
     .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0))
     .slice(0, Math.max(1, Math.min(Number(limit) || 50, 200)));
 }
 
 function listRecentMessages(session, limit = 500, chatIds = null) {
-  let messages = Array.from(session.messages.values());
+  let messages = Array.from(session.messages.values()).filter((m) => m?.text && isImportableChatJid(m.remoteJid || m.jid));
   if (chatIds?.size) {
     messages = messages.filter((m) => chatIds.has(m.remoteJid) || chatIds.has(m.jid));
   }
@@ -320,14 +423,52 @@ async function emitWebhook(type, payload) {
   }
 }
 
-async function emitHistorySnapshot(session, { limit = 50, isLatest = false, source = 'snapshot' } = {}) {
+async function fetchAvatar(session, jid) {
+  if (!jid || !session.socket?.profilePictureUrl || !isDirectWhatsappJid(jid)) return null;
+  const cached = session.avatarCache.get(jid);
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < 24 * 60 * 60 * 1000) return cached.url || null;
+
+  try {
+    const url = await Promise.race([
+      session.socket.profilePictureUrl(jid, 'image'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('avatar_timeout')), 3500)),
+    ]);
+    session.avatarCache.set(jid, { url: url || null, fetchedAt: now });
+    return url || null;
+  } catch {
+    session.avatarCache.set(jid, { url: null, fetchedAt: now });
+    return null;
+  }
+}
+
+async function hydrateRecentAvatars(session, chats = []) {
+  const targets = chats.slice(0, AVATAR_HYDRATE_LIMIT).filter((chat) => isDirectWhatsappJid(chat.jid));
+  for (const chat of targets) {
+    const contact = ensureContactForChat(session, chat);
+    if (!contact || contact.avatar_url || contact.avatarUrl) continue;
+    const avatar = await fetchAvatar(session, chat.jid);
+    if (!avatar) continue;
+    session.contacts.set(chat.jid, {
+      ...contact,
+      avatarUrl: avatar,
+      avatar_url: avatar,
+      avatar_last_fetched_at: nowIso(),
+      updatedAt: nowIso(),
+    });
+  }
+}
+
+async function emitHistorySnapshot(session, { limit = HISTORY_CHAT_LIMIT, isLatest = false, source = 'snapshot' } = {}) {
   const chats = listRecentChats(session, limit);
+  await hydrateRecentAvatars(session, chats);
+
   const chatIds = new Set(chats.map((c) => c.jid || c.id).filter(Boolean));
-  const messages = listRecentMessages(session, limit * 20, chatIds);
-  const contacts = listSortedValues(session.contacts).filter((c) => {
-    if (!chatIds.size) return true;
-    return chatIds.has(c.jid) || chatIds.has(c.id);
-  });
+  const messages = listRecentMessages(session, Math.min(limit * 10, 500), chatIds);
+  const contacts = chats
+    .map((chat) => ensureContactForChat(session, chat))
+    .filter(Boolean)
+    .filter((contact) => chatIds.has(contact.jid || contact.id));
 
   const basePayload = {
     sessionId: session.id,
@@ -335,6 +476,8 @@ async function emitHistorySnapshot(session, { limit = 50, isLatest = false, sour
     connectionId: session.connectionId || null,
     source,
   };
+
+  logger.info({ sessionId: session.id, contacts: contacts.length, chats: chats.length, messages: messages.length, source }, 'Emitting parsed WhatsApp history snapshot');
 
   if (contacts.length) {
     await emitWebhook('history.contacts', { ...basePayload, items: contacts });
@@ -357,12 +500,31 @@ async function emitHistorySnapshot(session, { limit = 50, isLatest = false, sour
     isLatest: Boolean(isLatest),
   });
 
+  session.lastHistorySnapshotSentAt = Date.now();
+
   return {
     contacts_imported: contacts.length,
     chats_imported: chats.length,
     messages_imported: messages.length,
     status: contacts.length || chats.length || messages.length ? 'ready' : 'empty_result',
   };
+}
+
+function scheduleHistorySnapshot(session, { force = false, isLatest = false, source = 'scheduled' } = {}) {
+  if (!session) return;
+  if (session.historySnapshotTimer) clearTimeout(session.historySnapshotTimer);
+
+  const elapsed = Date.now() - (session.lastHistorySnapshotSentAt || 0);
+  if (!force && !isLatest && elapsed < HISTORY_SNAPSHOT_COOLDOWN_MS) {
+    return;
+  }
+
+  const delay = force || isLatest ? 1200 : HISTORY_SNAPSHOT_DELAY_MS;
+  session.historySnapshotTimer = setTimeout(() => {
+    session.historySnapshotTimer = null;
+    emitHistorySnapshot(session, { limit: HISTORY_CHAT_LIMIT, isLatest, source })
+      .catch((error) => logger.warn({ err: error, sessionId: session.id }, 'History snapshot emit failed'));
+  }, delay);
 }
 
 async function bindSocket(session, isRestore = false) {
@@ -389,7 +551,7 @@ async function bindSocket(session, isRestore = false) {
 
   socket.ev.on('creds.update', saveCreds);
 
-  socket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }) => {
+  socket.ev.on('messaging-history.set', ({ chats, contacts, messages, isLatest }) => {
     upsertContacts(session, contacts || []);
     upsertChats(session, chats || []);
     upsertMessages(session, messages || []);
@@ -398,63 +560,38 @@ async function bindSocket(session, isRestore = false) {
     session.historySyncedAt = nowIso();
     session.lastActivityAt = nowIso();
 
-    await emitHistorySnapshot(session, {
-      limit: Number(process.env.INITIAL_HISTORY_CHAT_LIMIT || 50),
+    // Important: Baileys sends history in many chunks. Do NOT blast Base44 on every
+    // chunk; that is what was causing 429s and half-imports. Emit once after the
+    // latest chunk, or a cooled-down partial snapshot if latest never arrives.
+    scheduleHistorySnapshot(session, {
+      force: Boolean(isLatest),
       isLatest: Boolean(isLatest),
       source: 'messaging-history.set',
     });
   });
 
-  socket.ev.on('contacts.upsert', async (contacts) => {
+  socket.ev.on('contacts.upsert', (contacts) => {
     upsertContacts(session, contacts || []);
     session.lastActivityAt = nowIso();
-    if (contacts?.length) {
-      await emitWebhook('history.contacts', {
-        sessionId: session.id,
-        workspaceId: session.workspaceId || null,
-        connectionId: session.connectionId || null,
-        items: contacts.map(normalizeContact),
-      });
-    }
+    scheduleHistorySnapshot(session, { source: 'contacts.upsert' });
   });
 
-  socket.ev.on('contacts.update', async (contacts) => {
+  socket.ev.on('contacts.update', (contacts) => {
     upsertContacts(session, contacts || []);
     session.lastActivityAt = nowIso();
-    if (contacts?.length) {
-      await emitWebhook('history.contacts', {
-        sessionId: session.id,
-        workspaceId: session.workspaceId || null,
-        connectionId: session.connectionId || null,
-        items: contacts.map(normalizeContact),
-      });
-    }
+    scheduleHistorySnapshot(session, { source: 'contacts.update' });
   });
 
-  socket.ev.on('chats.upsert', async (chats) => {
+  socket.ev.on('chats.upsert', (chats) => {
     upsertChats(session, chats || []);
     session.lastActivityAt = nowIso();
-    if (chats?.length) {
-      await emitWebhook('history.chats', {
-        sessionId: session.id,
-        workspaceId: session.workspaceId || null,
-        connectionId: session.connectionId || null,
-        items: chats.map(normalizeChat),
-      });
-    }
+    scheduleHistorySnapshot(session, { source: 'chats.upsert' });
   });
 
-  socket.ev.on('chats.update', async (chats) => {
+  socket.ev.on('chats.update', (chats) => {
     upsertChats(session, chats || []);
     session.lastActivityAt = nowIso();
-    if (chats?.length) {
-      await emitWebhook('history.chats', {
-        sessionId: session.id,
-        workspaceId: session.workspaceId || null,
-        connectionId: session.connectionId || null,
-        items: chats.map(normalizeChat),
-      });
-    }
+    scheduleHistorySnapshot(session, { source: 'chats.update' });
   });
 
   socket.ev.on('connection.update', async (update) => {
@@ -535,51 +672,110 @@ async function bindSocket(session, isRestore = false) {
     upsertMessages(session, messages);
     session.lastActivityAt = nowIso();
 
-    if (type !== 'notify') return;
+    const normalizedMessages = messages.map(normalizeMessage).filter(Boolean);
+    if (!normalizedMessages.length) return;
 
-    for (const msg of messages) {
-      if (!msg?.message) continue;
-      const normalized = normalizeMessage(msg);
+    // Live notify events should show immediately in Base44. Phone-side outbound
+    // messages are real history.messages rows, not status-only events.
+    if (type === 'notify') {
+      for (const normalized of normalizedMessages) {
+        if (normalized.fromSelf) {
+          await emitWebhook('history.messages', {
+            sessionId: session.id,
+            workspaceId: session.workspaceId || null,
+            connectionId: session.connectionId || null,
+            source: 'messages.upsert.from_me',
+            items: [normalized],
+          });
+          continue;
+        }
 
-      if (msg.key?.fromMe) {
-        await emitWebhook('message.sent', {
+        const avatar = await fetchAvatar(session, normalized.remoteJid);
+        const contact = ensureContactForChat(session, { jid: normalized.remoteJid, name: normalized.pushName || extractPhoneFromJid(normalized.remoteJid) });
+        if (contact && (normalized.pushName || avatar)) {
+          session.contacts.set(normalized.remoteJid, {
+            ...contact,
+            name: normalized.pushName || contact.name,
+            displayName: normalized.pushName || contact.displayName,
+            display_name: normalized.pushName || contact.display_name,
+            pushName: normalized.pushName || contact.pushName,
+            push_name: normalized.pushName || contact.push_name,
+            avatarUrl: avatar || contact.avatarUrl,
+            avatar_url: avatar || contact.avatar_url,
+            avatar_last_fetched_at: avatar ? nowIso() : contact.avatar_last_fetched_at,
+            updatedAt: nowIso(),
+          });
+
+          await emitWebhook('history.contacts', {
+            sessionId: session.id,
+            workspaceId: session.workspaceId || null,
+            connectionId: session.connectionId || null,
+            source: 'live-message-contact-hydration',
+            items: [session.contacts.get(normalized.remoteJid)],
+          });
+        }
+
+        await emitWebhook('message.received', {
           sessionId: session.id,
           workspaceId: session.workspaceId || null,
           connectionId: session.connectionId || null,
           message_id: normalized.id,
-          providerMessageId: normalized.id,
+          messageId: normalized.id,
           jid: normalized.remoteJid,
           remoteJid: normalized.remoteJid,
-          to: normalized.remoteJid,
+          from_number: extractPhoneFromJid(normalized.remoteJid),
+          from_name: normalized.pushName || null,
+          push_name: normalized.pushName || null,
+          avatar_url: avatar || null,
+          message_content: normalized.text,
           text: normalized.text,
+          message_type: normalized.type,
           timestamp: normalized.timestamp,
+          messageTimestamp: normalized.messageTimestamp,
+          from_self: false,
+          fromSelf: false,
+          is_group: false,
+          is_status: false,
+          is_broadcast: false,
         });
-        continue;
       }
+    }
+  });
 
-      await emitWebhook('message.received', {
+  socket.ev.on('messages.update', async (updates = []) => {
+    for (const update of updates) {
+      const status = mapAckToStatus(update?.update?.status ?? update?.update?.ack ?? update?.status ?? update?.ack);
+      const messageId = update?.key?.id;
+      const jid = update?.key?.remoteJid;
+      if (!status || !messageId || !isImportableChatJid(jid)) continue;
+
+      await emitWebhook('message.status', {
         sessionId: session.id,
         workspaceId: session.workspaceId || null,
         connectionId: session.connectionId || null,
-        message_id: normalized.id,
-        messageId: normalized.id,
-        jid: normalized.remoteJid,
-        remoteJid: normalized.remoteJid,
-        from_number: extractPhoneFromJid(normalized.remoteJid),
-        from_name: msg.pushName || normalized.pushName || null,
-        push_name: msg.pushName || normalized.pushName || null,
-        message_content: normalized.text,
-        text: normalized.text,
-        message_type: normalized.type,
-        timestamp: normalized.timestamp,
-        messageTimestamp: normalized.messageTimestamp,
-        from_self: false,
-        fromSelf: false,
-        is_group: String(normalized.remoteJid || '').includes('@g.us'),
-        is_status: String(normalized.remoteJid || '').includes('status@'),
-        is_broadcast: String(normalized.remoteJid || '').includes('@broadcast'),
+        message_id: messageId,
+        jid,
+        status,
+        raw_ack: update?.update?.status ?? update?.update?.ack ?? update?.status ?? update?.ack,
+        timestamp: nowIso(),
       });
     }
+  });
+
+  socket.ev.on('presence.update', async ({ id, presences }) => {
+    if (!isImportableChatJid(id)) return;
+    const entries = Object.values(presences || {});
+    const state = entries.find(Boolean)?.lastKnownPresence || null;
+    if (!state) return;
+    const presence = state === 'composing' ? 'composing' : state === 'paused' ? 'paused' : state;
+    await emitWebhook('presence.update', {
+      sessionId: session.id,
+      workspaceId: session.workspaceId || null,
+      connectionId: session.connectionId || null,
+      jid: id,
+      presence,
+      timestamp: nowIso(),
+    });
   });
 }
 
@@ -669,7 +865,7 @@ export function getSessionMessages(sessionId, { limit = 100, remoteJid = null } 
   const session = sessions.get(sessionId);
   if (!session) return null;
 
-  let messages = Array.from(session.messages.values());
+  let messages = Array.from(session.messages.values()).filter((m) => m?.text && isImportableChatJid(m.remoteJid || m.jid));
 
   if (remoteJid) {
     messages = messages.filter((message) => message.remoteJid === remoteJid || message.jid === remoteJid);
@@ -731,11 +927,11 @@ export async function sendTextMessage(sessionId, { to, text }) {
     const result = await session.socket.sendMessage(jid, { text });
     session.lastActivityAt = nowIso();
 
-    await emitWebhook('message.sent', {
+    await emitWebhook('message.status', {
       sessionId: session.id,
       connectionId: session.connectionId || null,
-      to: jid,
       jid,
+      status: 'sent',
       text,
       providerMessageId: result?.key?.id || null,
       message_id: result?.key?.id || null,
@@ -748,13 +944,13 @@ export async function sendTextMessage(sessionId, { to, text }) {
       to: jid,
     };
   } catch (error) {
-    await emitWebhook('message.failed', {
+    await emitWebhook('message.status', {
       sessionId: session.id,
       connectionId: session.connectionId || null,
-      to: jid,
       jid,
+      status: 'failed',
       text,
-      error: error.message,
+      error_message: error.message,
       timestamp: nowIso(),
     });
     throw error;
@@ -771,6 +967,7 @@ export async function deleteSession(sessionId) {
     // ignore logout failures
   }
 
+  if (session.historySnapshotTimer) clearTimeout(session.historySnapshotTimer);
   sessions.delete(sessionId);
   await removeSessionDirectory(sessionId);
 
