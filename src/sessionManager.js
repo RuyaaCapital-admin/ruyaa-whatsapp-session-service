@@ -27,12 +27,12 @@ function getSessionsDir() {
 
 function extractPhoneFromJid(jid) {
   if (!jid) return null;
-  return jid.split(':')[0].split('@')[0] || null;
+  return String(jid).split(':')[0].split('@')[0] || null;
 }
 
 function normalizeRecipient(to) {
   if (!to) return null;
-  if (to.includes('@')) return to;
+  if (String(to).includes('@')) return to;
   const cleaned = String(to).replace(/[^\d]/g, '');
   return `${cleaned}@s.whatsapp.net`;
 }
@@ -63,7 +63,10 @@ function getMessageType(message) {
   }
 
   const keys = Object.keys(message);
-  return keys[0] || 'unknown';
+  const first = keys[0] || 'unknown';
+  if (first === 'conversation' || first === 'extendedTextMessage') return 'text';
+  if (first.endsWith('Message')) return first.replace('Message', '');
+  return first;
 }
 
 function getTimestampValue(value) {
@@ -88,17 +91,29 @@ function timestampToIso(value) {
 function normalizeContact(contact = {}) {
   const jid = contact.id || contact.jid || null;
   const phoneNumber = extractPhoneFromJid(jid);
-  const displayName = contact.notify || contact.name || contact.verifiedName || contact.pushName || phoneNumber || jid || 'Unknown';
+  const realName = contact.name || contact.verifiedName || contact.notify || contact.pushName || contact.short || null;
+  const displayName = realName || phoneNumber || jid || 'Unknown';
 
   return {
     id: jid || phoneNumber,
     jid,
+    phone: phoneNumber,
     phoneNumber,
+    phone_number: phoneNumber,
+    phone_number_normalized: phoneNumber,
+    name: realName || displayName,
     displayName,
+    display_name: displayName,
     pushName: contact.notify || contact.pushName || null,
+    push_name: contact.notify || contact.pushName || null,
     verifiedName: contact.verifiedName || null,
+    verified_name: contact.verifiedName || null,
     shortName: contact.short || null,
+    short_name: contact.short || null,
+    avatarUrl: contact.imgUrl || contact.avatarUrl || contact.profilePicUrl || null,
+    avatar_url: contact.imgUrl || contact.avatarUrl || contact.profilePicUrl || null,
     isBusiness: Boolean(contact.verifiedName),
+    is_business: Boolean(contact.verifiedName),
     updatedAt: nowIso(),
   };
 }
@@ -106,11 +121,16 @@ function normalizeContact(contact = {}) {
 function normalizeChat(chat = {}) {
   const jid = chat.id || null;
   const conversationTimestamp = chat.conversationTimestamp || chat.lastMessageRecvTimestamp || null;
+  const phone = extractPhoneFromJid(jid);
+  const name = chat.name || chat.subject || chat.title || phone || jid || 'Unknown chat';
 
   return {
     id: jid,
     jid,
-    name: chat.name || chat.subject || extractPhoneFromJid(jid) || jid || 'Unknown chat',
+    phone,
+    name,
+    title: name,
+    subject: chat.subject || null,
     unreadCount: chat.unreadCount || 0,
     archived: Boolean(chat.archive),
     pinned: Boolean(chat.pinned),
@@ -126,18 +146,32 @@ function normalizeMessage(message = {}) {
   const participant = message?.key?.participant || null;
   const from = jidNormalizedUser(participant || remoteJid || '');
   const providerMessageId = message?.key?.id || `${remoteJid || 'unknown'}-${getTimestampValue(message?.messageTimestamp) || Date.now()}`;
+  const type = getMessageType(message?.message);
+  const timestamp = timestampToIso(message?.messageTimestamp);
 
   return {
     id: providerMessageId,
+    messageId: providerMessageId,
+    message_id: providerMessageId,
     providerMessageId,
+    provider_message_id: providerMessageId,
+    jid: remoteJid,
     remoteJid,
     participant,
     from,
     fromMe: Boolean(message?.key?.fromMe),
+    fromSelf: Boolean(message?.key?.fromMe),
     text: getMessageText(message?.message),
-    messageType: getMessageType(message?.message),
+    body: getMessageText(message?.message),
+    type,
+    messageType: type,
+    message_type: type,
     messageTimestamp: getTimestampValue(message?.messageTimestamp),
-    messageAt: timestampToIso(message?.messageTimestamp),
+    timestamp,
+    messageAt: timestamp,
+    pushName: message?.pushName || null,
+    senderName: message?.pushName || null,
+    sender_name: message?.pushName || null,
     updatedAt: nowIso(),
   };
 }
@@ -171,6 +205,8 @@ function createSessionRecord({ id, label, workspaceId, connectionId }) {
 function publicSession(session) {
   return {
     id: session.id,
+    session_id: session.id,
+    sessionId: session.id,
     status: session.status,
     label: session.label || null,
     workspaceId: session.workspaceId || null,
@@ -245,6 +281,22 @@ function listSortedValues(map) {
   });
 }
 
+function listRecentChats(session, limit = 50) {
+  return Array.from(session.chats.values())
+    .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0))
+    .slice(0, Math.max(1, Math.min(Number(limit) || 50, 200)));
+}
+
+function listRecentMessages(session, limit = 500, chatIds = null) {
+  let messages = Array.from(session.messages.values());
+  if (chatIds?.size) {
+    messages = messages.filter((m) => chatIds.has(m.remoteJid) || chatIds.has(m.jid));
+  }
+  return messages
+    .sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0))
+    .slice(0, Math.max(1, Math.min(Number(limit) || 500, MAX_MESSAGE_CACHE)));
+}
+
 async function ensureSessionsDir() {
   await fs.mkdir(getSessionsDir(), { recursive: true });
 }
@@ -266,6 +318,51 @@ async function emitWebhook(type, payload) {
   } catch (error) {
     logger.warn({ err: error, type }, 'Webhook delivery failed');
   }
+}
+
+async function emitHistorySnapshot(session, { limit = 50, isLatest = false, source = 'snapshot' } = {}) {
+  const chats = listRecentChats(session, limit);
+  const chatIds = new Set(chats.map((c) => c.jid || c.id).filter(Boolean));
+  const messages = listRecentMessages(session, limit * 20, chatIds);
+  const contacts = listSortedValues(session.contacts).filter((c) => {
+    if (!chatIds.size) return true;
+    return chatIds.has(c.jid) || chatIds.has(c.id);
+  });
+
+  const basePayload = {
+    sessionId: session.id,
+    workspaceId: session.workspaceId || null,
+    connectionId: session.connectionId || null,
+    source,
+  };
+
+  if (contacts.length) {
+    await emitWebhook('history.contacts', { ...basePayload, items: contacts });
+  }
+  if (chats.length) {
+    await emitWebhook('history.chats', { ...basePayload, items: chats });
+  }
+  if (messages.length) {
+    await emitWebhook('history.messages', { ...basePayload, items: messages });
+  }
+
+  await emitWebhook('history.complete', {
+    ...basePayload,
+    contactsCount: contacts.length,
+    chatsCount: chats.length,
+    messagesCount: messages.length,
+    total_contacts: contacts.length,
+    total_chats: chats.length,
+    total_messages: messages.length,
+    isLatest: Boolean(isLatest),
+  });
+
+  return {
+    contacts_imported: contacts.length,
+    chats_imported: chats.length,
+    messages_imported: messages.length,
+    status: contacts.length || chats.length || messages.length ? 'ready' : 'empty_result',
+  };
 }
 
 async function bindSocket(session, isRestore = false) {
@@ -301,36 +398,63 @@ async function bindSocket(session, isRestore = false) {
     session.historySyncedAt = nowIso();
     session.lastActivityAt = nowIso();
 
-    await emitWebhook('session.history_sync', {
-      sessionId: session.id,
-      workspaceId: session.workspaceId || null,
-      connectionId: session.connectionId || null,
-      status: session.historySyncStatus,
-      contactsCount: session.contacts.size,
-      chatsCount: session.chats.size,
-      messagesCount: session.messages.size,
+    await emitHistorySnapshot(session, {
+      limit: Number(process.env.INITIAL_HISTORY_CHAT_LIMIT || 50),
       isLatest: Boolean(isLatest),
+      source: 'messaging-history.set',
     });
   });
 
-  socket.ev.on('contacts.upsert', (contacts) => {
+  socket.ev.on('contacts.upsert', async (contacts) => {
     upsertContacts(session, contacts || []);
     session.lastActivityAt = nowIso();
+    if (contacts?.length) {
+      await emitWebhook('history.contacts', {
+        sessionId: session.id,
+        workspaceId: session.workspaceId || null,
+        connectionId: session.connectionId || null,
+        items: contacts.map(normalizeContact),
+      });
+    }
   });
 
-  socket.ev.on('contacts.update', (contacts) => {
+  socket.ev.on('contacts.update', async (contacts) => {
     upsertContacts(session, contacts || []);
     session.lastActivityAt = nowIso();
+    if (contacts?.length) {
+      await emitWebhook('history.contacts', {
+        sessionId: session.id,
+        workspaceId: session.workspaceId || null,
+        connectionId: session.connectionId || null,
+        items: contacts.map(normalizeContact),
+      });
+    }
   });
 
-  socket.ev.on('chats.upsert', (chats) => {
+  socket.ev.on('chats.upsert', async (chats) => {
     upsertChats(session, chats || []);
     session.lastActivityAt = nowIso();
+    if (chats?.length) {
+      await emitWebhook('history.chats', {
+        sessionId: session.id,
+        workspaceId: session.workspaceId || null,
+        connectionId: session.connectionId || null,
+        items: chats.map(normalizeChat),
+      });
+    }
   });
 
-  socket.ev.on('chats.update', (chats) => {
+  socket.ev.on('chats.update', async (chats) => {
     upsertChats(session, chats || []);
     session.lastActivityAt = nowIso();
+    if (chats?.length) {
+      await emitWebhook('history.chats', {
+        sessionId: session.id,
+        workspaceId: session.workspaceId || null,
+        connectionId: session.connectionId || null,
+        items: chats.map(normalizeChat),
+      });
+    }
   });
 
   socket.ev.on('connection.update', async (update) => {
@@ -415,17 +539,45 @@ async function bindSocket(session, isRestore = false) {
 
     for (const msg of messages) {
       if (!msg?.message) continue;
-      if (msg.key?.fromMe) continue;
+      const normalized = normalizeMessage(msg);
+
+      if (msg.key?.fromMe) {
+        await emitWebhook('message.sent', {
+          sessionId: session.id,
+          workspaceId: session.workspaceId || null,
+          connectionId: session.connectionId || null,
+          message_id: normalized.id,
+          providerMessageId: normalized.id,
+          jid: normalized.remoteJid,
+          remoteJid: normalized.remoteJid,
+          to: normalized.remoteJid,
+          text: normalized.text,
+          timestamp: normalized.timestamp,
+        });
+        continue;
+      }
 
       await emitWebhook('message.received', {
         sessionId: session.id,
         workspaceId: session.workspaceId || null,
         connectionId: session.connectionId || null,
-        messageId: msg.key?.id || null,
-        remoteJid: msg.key?.remoteJid || null,
-        from: jidNormalizedUser(msg.key?.participant || msg.key?.remoteJid || ''),
-        text: getMessageText(msg.message),
-        messageTimestamp: msg.messageTimestamp || null,
+        message_id: normalized.id,
+        messageId: normalized.id,
+        jid: normalized.remoteJid,
+        remoteJid: normalized.remoteJid,
+        from_number: extractPhoneFromJid(normalized.remoteJid),
+        from_name: msg.pushName || normalized.pushName || null,
+        push_name: msg.pushName || normalized.pushName || null,
+        message_content: normalized.text,
+        text: normalized.text,
+        message_type: normalized.type,
+        timestamp: normalized.timestamp,
+        messageTimestamp: normalized.messageTimestamp,
+        from_self: false,
+        fromSelf: false,
+        is_group: String(normalized.remoteJid || '').includes('@g.us'),
+        is_status: String(normalized.remoteJid || '').includes('status@'),
+        is_broadcast: String(normalized.remoteJid || '').includes('@broadcast'),
       });
     }
   });
@@ -505,7 +657,7 @@ export function getSessionChats(sessionId) {
   const session = sessions.get(sessionId);
   if (!session) return null;
 
-  const chats = Array.from(session.chats.values()).sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0));
+  const chats = listRecentChats(session, 200);
 
   return {
     ...publicSession(session),
@@ -520,7 +672,7 @@ export function getSessionMessages(sessionId, { limit = 100, remoteJid = null } 
   let messages = Array.from(session.messages.values());
 
   if (remoteJid) {
-    messages = messages.filter((message) => message.remoteJid === remoteJid);
+    messages = messages.filter((message) => message.remoteJid === remoteJid || message.jid === remoteJid);
   }
 
   messages.sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
@@ -528,6 +680,31 @@ export function getSessionMessages(sessionId, { limit = 100, remoteJid = null } 
   return {
     ...publicSession(session),
     messages: messages.slice(0, Math.max(1, Math.min(Number(limit) || 100, MAX_MESSAGE_CACHE))),
+  };
+}
+
+export async function resyncSession(sessionId, { limit = 50 } = {}) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+  if (session.status !== 'connected') {
+    return {
+      success: false,
+      code: 'SESSION_NOT_CONNECTED',
+      message: 'WhatsApp session is not connected.',
+      status: session.status,
+    };
+  }
+
+  const result = await emitHistorySnapshot(session, {
+    limit,
+    isLatest: true,
+    source: 'manual-resync',
+  });
+
+  return {
+    success: true,
+    limit,
+    ...result,
   };
 }
 
@@ -558,8 +735,11 @@ export async function sendTextMessage(sessionId, { to, text }) {
       sessionId: session.id,
       connectionId: session.connectionId || null,
       to: jid,
+      jid,
       text,
       providerMessageId: result?.key?.id || null,
+      message_id: result?.key?.id || null,
+      timestamp: nowIso(),
     });
 
     return {
@@ -572,8 +752,10 @@ export async function sendTextMessage(sessionId, { to, text }) {
       sessionId: session.id,
       connectionId: session.connectionId || null,
       to: jid,
+      jid,
       text,
       error: error.message,
+      timestamp: nowIso(),
     });
     throw error;
   }
