@@ -26,9 +26,6 @@ function nowIso() {
 }
 
 function logEvent(step, fields = {}) {
-  // Plain JSON log line keyed by the inbound pipeline step. Pairs with the
-  // matching log lines in base44/whatsappWebhook so a payload can be traced
-  // across both services.
   try {
     console.log(JSON.stringify({ service: 'whatsapp-session', step, ts: nowIso(), ...fields }));
   } catch {
@@ -71,8 +68,6 @@ function isDirectWhatsappJid(jid) {
 }
 
 function isImportableChatJid(jid) {
-  // Keep the first version strict: direct user chats only. Groups/status/broadcasts
-  // are noisy and were creating garbage rows in Base44.
   return isDirectWhatsappJid(jid);
 }
 
@@ -394,19 +389,30 @@ function listSortedValues(map) {
   });
 }
 
+function listImportableChats(session) {
+  // All chats currently held in memory that we'd consider importable. This is
+  // the 'chats_found' denominator we report to the caller — it tells the
+  // user how many chats Baileys has actually exposed so far, which is often
+  // smaller than the limit they asked for.
+  return Array.from(session.chats.values()).filter((c) => isImportableChatJid(c?.jid || c?.id));
+}
+
 function listRecentChats(session, limit = 50) {
-  return Array.from(session.chats.values())
-    .filter((c) => isImportableChatJid(c?.jid || c?.id))
+  return listImportableChats(session)
     .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0))
     .slice(0, Math.max(1, Math.min(Number(limit) || 50, 200)));
 }
 
-function listRecentMessages(session, limit = 500, chatIds = null) {
+function listImportableMessages(session, chatIds = null) {
   let messages = Array.from(session.messages.values()).filter((m) => m?.text && isImportableChatJid(m.remoteJid || m.jid));
   if (chatIds?.size) {
     messages = messages.filter((m) => chatIds.has(m.remoteJid) || chatIds.has(m.jid));
   }
-  return messages
+  return messages;
+}
+
+function listRecentMessages(session, limit = 500, chatIds = null) {
+  return listImportableMessages(session, chatIds)
     .sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0))
     .slice(0, Math.max(1, Math.min(Number(limit) || 500, MAX_MESSAGE_CACHE)));
 }
@@ -471,15 +477,33 @@ async function hydrateRecentAvatars(session, chats = []) {
 }
 
 async function emitHistorySnapshot(session, { limit = HISTORY_CHAT_LIMIT, isLatest = false, source = 'snapshot' } = {}) {
-  const chats = listRecentChats(session, limit);
+  // Honest counts. `*_found` is what Baileys has actually exposed for this
+  // session right now; `*_imported` is what we forwarded to Base44 after
+  // applying the requested limit. When `chats_found` < `requested_limit` we
+  // tell the caller why so the UI can show a real reason instead of
+  // pretending we synced 50.
+  const requestedLimit = Number(limit) || HISTORY_CHAT_LIMIT;
+  const allChats = listImportableChats(session);
+  const chatsFound = allChats.length;
+
+  const chats = listRecentChats(session, requestedLimit);
   await hydrateRecentAvatars(session, chats);
 
   const chatIds = new Set(chats.map((c) => c.jid || c.id).filter(Boolean));
-  const messages = listRecentMessages(session, Math.min(limit * 10, 500), chatIds);
+  const allChatIds = new Set(allChats.map((c) => c.jid || c.id).filter(Boolean));
+  const messagesFound = listImportableMessages(session, allChatIds).length;
+  const messages = listRecentMessages(session, Math.min(requestedLimit * 10, 500), chatIds);
   const contacts = chats
     .map((chat) => ensureContactForChat(session, chat))
     .filter(Boolean)
     .filter((contact) => chatIds.has(contact.jid || contact.id));
+  const contactsFound = Array.from(session.contacts.values()).filter((c) => isDirectWhatsappJid(c?.jid || c?.id)).length;
+
+  const skippedReason = chatsFound === 0
+    ? 'WhatsApp has not exposed any chats to this session yet. Open WhatsApp on the linked phone and let it sync.'
+    : chatsFound < requestedLimit
+      ? `WhatsApp only exposed ${chatsFound} chat${chatsFound === 1 ? '' : 's'} to this session so far. Open more chats on the linked phone or wait for Baileys to receive them.`
+      : null;
 
   const basePayload = {
     sessionId: session.id,
@@ -488,7 +512,20 @@ async function emitHistorySnapshot(session, { limit = HISTORY_CHAT_LIMIT, isLate
     source,
   };
 
-  logger.info({ sessionId: session.id, contacts: contacts.length, chats: chats.length, messages: messages.length, source }, 'Emitting parsed WhatsApp history snapshot');
+  logEvent('history_snapshot', {
+    session_id: session.id,
+    connection_id: session.connectionId || null,
+    source,
+    requested_limit: requestedLimit,
+    contacts_found: contactsFound,
+    chats_found: chatsFound,
+    messages_found: messagesFound,
+    contacts_imported: contacts.length,
+    chats_imported: chats.length,
+    messages_imported: messages.length,
+    skipped_reason: skippedReason,
+    is_latest: Boolean(isLatest),
+  });
 
   if (contacts.length) {
     await emitWebhook('history.contacts', { ...basePayload, items: contacts });
@@ -508,15 +545,25 @@ async function emitHistorySnapshot(session, { limit = HISTORY_CHAT_LIMIT, isLate
     total_contacts: contacts.length,
     total_chats: chats.length,
     total_messages: messages.length,
+    requested_limit: requestedLimit,
+    contacts_found: contactsFound,
+    chats_found: chatsFound,
+    messages_found: messagesFound,
+    skipped_reason: skippedReason,
     isLatest: Boolean(isLatest),
   });
 
   session.lastHistorySnapshotSentAt = Date.now();
 
   return {
+    requested_limit: requestedLimit,
+    contacts_found: contactsFound,
+    chats_found: chatsFound,
+    messages_found: messagesFound,
     contacts_imported: contacts.length,
     chats_imported: chats.length,
     messages_imported: messages.length,
+    skipped_reason: skippedReason,
     status: contacts.length || chats.length || messages.length ? 'ready' : 'empty_result',
   };
 }
@@ -571,9 +618,6 @@ async function bindSocket(session, isRestore = false) {
     session.historySyncedAt = nowIso();
     session.lastActivityAt = nowIso();
 
-    // Important: Baileys sends history in many chunks. Do NOT blast Base44 on every
-    // chunk; that is what was causing 429s and half-imports. Emit once after the
-    // latest chunk, or a cooled-down partial snapshot if latest never arrives.
     scheduleHistorySnapshot(session, {
       force: Boolean(isLatest),
       isLatest: Boolean(isLatest),
@@ -693,8 +737,6 @@ async function bindSocket(session, isRestore = false) {
     });
     if (!normalizedMessages.length) return;
 
-    // Live notify events should show immediately in Base44. Phone-side outbound
-    // messages are real history.messages rows, not status-only events.
     if (type === 'notify') {
       for (const normalized of normalizedMessages) {
         // Direction is decided ONLY from Baileys' key.fromMe bit which we
@@ -936,6 +978,12 @@ export async function resyncSession(sessionId, { limit = 50 } = {}) {
     };
   }
 
+  logEvent('resync_received', {
+    session_id: session.id,
+    connection_id: session.connectionId || null,
+    requested_limit: Number(limit) || 0,
+  });
+
   const result = await emitHistorySnapshot(session, {
     limit,
     isLatest: true,
@@ -944,7 +992,7 @@ export async function resyncSession(sessionId, { limit = 50 } = {}) {
 
   return {
     success: true,
-    limit,
+    limit: result.requested_limit,
     ...result,
   };
 }
