@@ -25,6 +25,17 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function logEvent(step, fields = {}) {
+  // Plain JSON log line keyed by the inbound pipeline step. Pairs with the
+  // matching log lines in base44/whatsappWebhook so a payload can be traced
+  // across both services.
+  try {
+    console.log(JSON.stringify({ service: 'whatsapp-session', step, ts: nowIso(), ...fields }));
+  } catch {
+    /* ignore log serialization errors */
+  }
+}
+
 function getSessionsDir() {
   return process.env.SESSIONS_DIR || path.resolve('data/sessions');
 }
@@ -673,13 +684,30 @@ async function bindSocket(session, isRestore = false) {
     session.lastActivityAt = nowIso();
 
     const normalizedMessages = messages.map(normalizeMessage).filter(Boolean);
+    logEvent('messages_upsert', {
+      session_id: session.id,
+      connection_id: session.connectionId || null,
+      baileys_type: type,
+      raw_count: messages.length,
+      normalized_count: normalizedMessages.length,
+    });
     if (!normalizedMessages.length) return;
 
     // Live notify events should show immediately in Base44. Phone-side outbound
     // messages are real history.messages rows, not status-only events.
     if (type === 'notify') {
       for (const normalized of normalizedMessages) {
+        // Direction is decided ONLY from Baileys' key.fromMe bit which we
+        // captured into normalized.fromMe / fromSelf. We never look at the
+        // pushName / display name for direction.
         if (normalized.fromSelf) {
+          logEvent('emit_outbound_from_phone', {
+            session_id: session.id,
+            connection_id: session.connectionId || null,
+            jid: normalized.remoteJid,
+            message_id: normalized.id,
+            from_me: true,
+          });
           await emitWebhook('history.messages', {
             sessionId: session.id,
             workspaceId: session.workspaceId || null,
@@ -715,6 +743,15 @@ async function bindSocket(session, isRestore = false) {
           });
         }
 
+        logEvent('emit_inbound_message_received', {
+          session_id: session.id,
+          connection_id: session.connectionId || null,
+          jid: normalized.remoteJid,
+          message_id: normalized.id,
+          from_me: false,
+          push_name: normalized.pushName || null,
+          message_type: normalized.type,
+        });
         await emitWebhook('message.received', {
           sessionId: session.id,
           workspaceId: session.workspaceId || null,
@@ -726,6 +763,7 @@ async function bindSocket(session, isRestore = false) {
           from_number: extractPhoneFromJid(normalized.remoteJid),
           from_name: normalized.pushName || null,
           push_name: normalized.pushName || null,
+          pushName: normalized.pushName || null,
           avatar_url: avatar || null,
           message_content: normalized.text,
           text: normalized.text,
@@ -734,11 +772,18 @@ async function bindSocket(session, isRestore = false) {
           messageTimestamp: normalized.messageTimestamp,
           from_self: false,
           fromSelf: false,
+          fromMe: false,
           is_group: false,
           is_status: false,
           is_broadcast: false,
         });
       }
+    } else {
+      logEvent('messages_upsert_skipped_non_notify', {
+        session_id: session.id,
+        connection_id: session.connectionId || null,
+        baileys_type: type,
+      });
     }
   });
 

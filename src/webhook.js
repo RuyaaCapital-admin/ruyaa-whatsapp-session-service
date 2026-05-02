@@ -89,6 +89,7 @@ export async function sendWebhook(type, payload = {}) {
   const body = JSON.stringify(bodyObject);
   const signature = createSignature(body, secret);
 
+  const sentAt = Date.now();
   console.log('[webhook] sending', JSON.stringify({
     event_type: bodyObject.event_type,
     raw_event_type: bodyObject.raw_event_type,
@@ -106,6 +107,15 @@ export async function sendWebhook(type, payload = {}) {
     },
     body,
   });
+
+  console.log('[webhook] response', JSON.stringify({
+    event_type: bodyObject.event_type,
+    raw_event_type: bodyObject.raw_event_type,
+    session_id: bodyObject.session_id,
+    status: response.status,
+    ok: response.ok,
+    duration_ms: Date.now() - sentAt,
+  }));
 
   if (!response.ok) {
     const text = await response.text().catch(() => '');
